@@ -4,6 +4,8 @@ import aiosqlite
 import tempfile
 from pathlib import Path
 import json
+from contextlib import asynccontextmanager
+import aiofiles
 
 # Use temp directory for cloud deployment (writable)
 TEMP_DIR = tempfile.gettempdir()
@@ -12,55 +14,59 @@ CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 print(f"Database path: {DB_PATH}")
 
-mcp = FastMCP("ExpenseTracker")
-
-def init_db():
-    """Initialize database synchronously on startup"""
+async def init_db():
+    """Initialize database asynchronously on startup"""
     try:
-        import sqlite3
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("PRAGMA journal_mode=WAL")
-        
-        # Create expenses table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS expenses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                amount REAL NOT NULL,
-                category TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT '',
-                person TEXT DEFAULT 'ashu'
-            )
-        """)
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
 
-        # Create credits table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS credits(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                amount REAL NOT NULL,
-                source TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT '',
-                person TEXT DEFAULT 'ashu'
-            )
-        """)
+            # Create expenses table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS expenses(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    subcategory TEXT DEFAULT '',
+                    note TEXT DEFAULT '',
+                    person TEXT DEFAULT 'ashu'
+                )
+            """)
 
-        # Test write access
-        conn.execute("INSERT OR IGNORE INTO expenses(date, amount, category, person) VALUES ('2000-01-01', 0, 'test', 'system')")
-        conn.execute("DELETE FROM expenses WHERE category = 'test'")
-        
-        conn.commit()
-        conn.close()
-        print("Database initialized successfully with write access")
-        
+            # Create credits table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS credits(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    subcategory TEXT DEFAULT '',
+                    note TEXT DEFAULT '',
+                    person TEXT DEFAULT 'ashu'
+                )
+            """)
+
+            # Test write access
+            await conn.execute("INSERT OR IGNORE INTO expenses(date, amount, category, person) VALUES ('2000-01-01', 0, 'test', 'system')")
+            await conn.execute("DELETE FROM expenses WHERE category = 'test'")
+
+            await conn.commit()
+            print("Database initialized successfully with write access")
+
     except Exception as e:
         print(f"Database initialization error: {e}")
         raise
 
-# Initialize on module load
-init_db()
+@asynccontextmanager
+async def lifespan(app):
+    """Lifespan context manager for FastMCP"""
+    # Startup: Initialize database
+    await init_db()
+    yield
+    # Shutdown: cleanup if needed
+    print("Shutting down ExpenseTracker")
+
+mcp = FastMCP("ExpenseTracker", lifespan=lifespan)
 
 @mcp.tool()
 async def add_expense(date: str, amount: float, category: str, person: str, subcategory: str = "", note: str = ""):
@@ -289,8 +295,8 @@ async def delete_credit(id: int):
         return {"status": "error", "message": f"Failed to delete credit: {str(e)}"}
 
 @mcp.resource("expense://categories", mime_type="application/json")
-def categories():
-    """Read categories from JSON file"""
+async def categories():
+    """Read categories from JSON file asynchronously"""
     try:
         # Default categories
         default_categories = {
@@ -307,14 +313,15 @@ def categories():
                 "Other"
             ]
         }
-        
-        # Try to read from file, fallback to defaults
+
+        # Try to read from file asynchronously, fallback to defaults
         try:
-            with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-                return f.read()
+            async with aiofiles.open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+                content = await f.read()
+                return content
         except FileNotFoundError:
             return json.dumps(default_categories, indent=2)
-            
+
     except Exception as e:
         return f'{{"error": "Failed to read categories: {str(e)}"}}'
 
