@@ -1,15 +1,28 @@
 from fastmcp import FastMCP
 import os
 import sqlite3
+from pathlib import Path
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
+# Use absolute paths and ensure directory exists
+BASE_DIR = Path(__file__).parent.absolute()
+DB_PATH = BASE_DIR / "expenses.db"
+CATEGORIES_PATH = BASE_DIR / "categories.json"
 
 mcp = FastMCP("ExpenseTracker")
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""
+    """Initialize database with proper error handling"""
+    try:
+        # Ensure directory exists
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
+        
+        cursor = conn.cursor()
+        
+        # Create expenses table
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS expenses(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL,
@@ -21,8 +34,8 @@ def init_db():
             )
         """)
 
-        # New table for credits/income
-        c.execute("""
+        # Create credits table
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS credits(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL,
@@ -34,43 +47,76 @@ def init_db():
             )
         """)
 
-        # Migration: Add person column to existing tables if not present
+        # Migration: Add person column if not present
         try:
-            c.execute("ALTER TABLE expenses ADD COLUMN person TEXT DEFAULT 'ashu'")
+            cursor.execute("ALTER TABLE expenses ADD COLUMN person TEXT DEFAULT 'ashu'")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
         try:
-            c.execute("ALTER TABLE credits ADD COLUMN person TEXT DEFAULT 'ashu'")
+            cursor.execute("ALTER TABLE credits ADD COLUMN person TEXT DEFAULT 'ashu'")
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        raise
 
 init_db()
 
 @mcp.tool()
-def add_expense(date, amount, category, person, subcategory="", note=""):
-    '''Add a new expense entry to the database.'''
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+def add_expense(date: str, amount: float, category: str, person: str, subcategory: str = "", note: str = ""):
+    """Add a new expense entry to the database."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        cursor = conn.cursor()
+        
+        cursor.execute(
             "INSERT INTO expenses(date, amount, category, subcategory, note, person) VALUES (?,?,?,?,?,?)",
-            (date, amount, category, subcategory, note, person)
+            (date, float(amount), category, subcategory, note, person)
         )
-        return {"status": "ok", "id": cur.lastrowid}
+        
+        expense_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        return {"status": "ok", "id": expense_id, "message": f"Expense added successfully with ID {expense_id}"}
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to add expense: {str(e)}"}
 
 @mcp.tool()
-def add_credit(date, amount, source, person, subcategory="", note=""):
-    '''Add a new credit/income entry to the database.'''
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+def add_credit(date: str, amount: float, source: str, person: str, subcategory: str = "", note: str = ""):
+    """Add a new credit/income entry to the database."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        cursor = conn.cursor()
+        
+        cursor.execute(
             "INSERT INTO credits(date, amount, source, subcategory, note, person) VALUES (?,?,?,?,?,?)",
-            (date, amount, source, subcategory, note, person)
+            (date, float(amount), source, subcategory, note, person)
         )
-        return {"status": "ok", "id": cur.lastrowid}
+        
+        credit_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        return {"status": "ok", "id": credit_id, "message": f"Credit added successfully with ID {credit_id}"}
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to add credit: {str(e)}"}
     
 @mcp.tool()
-def list_expenses(start_date, end_date, person=None):
-    '''List expense entries within an inclusive date range. Optionally filter by person.'''
-    with sqlite3.connect(DB_PATH) as c:
+def list_expenses(start_date: str, end_date: str, person: str = None):
+    """List expense entries within an inclusive date range. Optionally filter by person."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
         query = """
             SELECT id, date, amount, category, subcategory, note, person
             FROM expenses
@@ -84,14 +130,23 @@ def list_expenses(start_date, end_date, person=None):
 
         query += " ORDER BY date ASC, id ASC"
 
-        cur = c.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [dict(row) for row in rows]
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to list expenses: {str(e)}"}
 
 @mcp.tool()
-def list_credits(start_date, end_date, person=None):
-    '''List credit/income entries within an inclusive date range. Optionally filter by person.'''
-    with sqlite3.connect(DB_PATH) as c:
+def list_credits(start_date: str, end_date: str, person: str = None):
+    """List credit/income entries within an inclusive date range. Optionally filter by person."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
         query = """
             SELECT id, date, amount, source, subcategory, note, person
             FROM credits
@@ -105,21 +160,28 @@ def list_credits(start_date, end_date, person=None):
 
         query += " ORDER BY date ASC, id ASC"
 
-        cur = c.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [dict(row) for row in rows]
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to list credits: {str(e)}"}
 
 @mcp.tool()
-def summarize(start_date, end_date, category=None, person=None):
-    '''Summarize expenses by category within an inclusive date range. Optionally filter by category and/or person.'''
-    with sqlite3.connect(DB_PATH) as c:
-        query = (
-            """
+def summarize(start_date: str, end_date: str, category: str = None, person: str = None):
+    """Summarize expenses by category within an inclusive date range. Optionally filter by category and/or person."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        query = """
             SELECT category, SUM(amount) AS total_amount
             FROM expenses
             WHERE date BETWEEN ? AND ?
-            """
-        )
+        """
         params = [start_date, end_date]
 
         if category:
@@ -132,21 +194,28 @@ def summarize(start_date, end_date, category=None, person=None):
 
         query += " GROUP BY category ORDER BY category ASC"
 
-        cur = c.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [dict(row) for row in rows]
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to summarize expenses: {str(e)}"}
 
 @mcp.tool()
-def summarize_credits(start_date, end_date, source=None, person=None):
-    '''Summarize credits/income by source within an inclusive date range. Optionally filter by source and/or person.'''
-    with sqlite3.connect(DB_PATH) as c:
-        query = (
-            """
+def summarize_credits(start_date: str, end_date: str, source: str = None, person: str = None):
+    """Summarize credits/income by source within an inclusive date range. Optionally filter by source and/or person."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        query = """
             SELECT source, SUM(amount) AS total_amount
             FROM credits
             WHERE date BETWEEN ? AND ?
-            """
-        )
+        """
         params = [start_date, end_date]
 
         if source:
@@ -159,14 +228,22 @@ def summarize_credits(start_date, end_date, source=None, person=None):
 
         query += " GROUP BY source ORDER BY source ASC"
 
-        cur = c.execute(query, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [dict(row) for row in rows]
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to summarize credits: {str(e)}"}
 
 @mcp.tool()
-def get_balance(start_date, end_date, person=None):
-    '''Calculate net balance (total credits - total expenses) within a date range. Optionally filter by person.'''
-    with sqlite3.connect(DB_PATH) as c:
+def get_balance(start_date: str, end_date: str, person: str = None):
+    """Calculate net balance (total credits - total expenses) within a date range. Optionally filter by person."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        cursor = conn.cursor()
+        
         # Get total expenses
         expense_query = "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE date BETWEEN ? AND ?"
         expense_params = [start_date, end_date]
@@ -175,7 +252,7 @@ def get_balance(start_date, end_date, person=None):
             expense_query += " AND person = ?"
             expense_params.append(person)
 
-        expense_result = c.execute(expense_query, expense_params).fetchone()
+        expense_result = cursor.execute(expense_query, expense_params).fetchone()
         total_expenses = expense_result[0]
 
         # Get total credits
@@ -186,8 +263,10 @@ def get_balance(start_date, end_date, person=None):
             credit_query += " AND person = ?"
             credit_params.append(person)
 
-        credit_result = c.execute(credit_query, credit_params).fetchone()
+        credit_result = cursor.execute(credit_query, credit_params).fetchone()
         total_credits = credit_result[0]
+
+        conn.close()
 
         net_balance = total_credits - total_expenses
 
@@ -203,38 +282,68 @@ def get_balance(start_date, end_date, person=None):
             result["person"] = person
 
         return result
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to calculate balance: {str(e)}"}
 
 @mcp.tool()
-def delete_expense(id):
-    '''Delete an expense entry by ID.'''
-    with sqlite3.connect(DB_PATH) as c:
+def delete_expense(id: int):
+    """Delete an expense entry by ID."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        cursor = conn.cursor()
+        
         # Check if expense exists
-        result = c.execute("SELECT * FROM expenses WHERE id = ?", (id,)).fetchone()
+        result = cursor.execute("SELECT * FROM expenses WHERE id = ?", (id,)).fetchone()
         if not result:
+            conn.close()
             return {"status": "error", "message": f"Expense with id {id} not found"}
 
         # Delete the expense
-        c.execute("DELETE FROM expenses WHERE id = ?", (id,))
+        cursor.execute("DELETE FROM expenses WHERE id = ?", (id,))
+        conn.commit()
+        conn.close()
+        
         return {"status": "ok", "message": f"Expense with id {id} deleted successfully"}
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to delete expense: {str(e)}"}
 
 @mcp.tool()
-def delete_credit(id):
-    '''Delete a credit/income entry by ID.'''
-    with sqlite3.connect(DB_PATH) as c:
+def delete_credit(id: int):
+    """Delete a credit/income entry by ID."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+        cursor = conn.cursor()
+        
         # Check if credit exists
-        result = c.execute("SELECT * FROM credits WHERE id = ?", (id,)).fetchone()
+        result = cursor.execute("SELECT * FROM credits WHERE id = ?", (id,)).fetchone()
         if not result:
+            conn.close()
             return {"status": "error", "message": f"Credit with id {id} not found"}
 
         # Delete the credit
-        c.execute("DELETE FROM credits WHERE id = ?", (id,))
+        cursor.execute("DELETE FROM credits WHERE id = ?", (id,))
+        conn.commit()
+        conn.close()
+        
         return {"status": "ok", "message": f"Credit with id {id} deleted successfully"}
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to delete credit: {str(e)}"}
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories():
-    # Read fresh each time so you can edit the file without restarting
-    with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+    """Read categories from JSON file"""
+    try:
+        if not CATEGORIES_PATH.exists():
+            return '{"categories": []}'
+        
+        with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        return f'{{"error": "Failed to read categories: {str(e)}"}}'
+
 
 # Start the server
 if __name__ == "__main__":
