@@ -1,8 +1,11 @@
 from fastmcp import FastMCP
 import os
-import aiosqlite  # Changed: sqlite3 → aiosqlite
+import aiosqlite
 import tempfile
-# Use temporary directory which should be writable
+from pathlib import Path
+import json
+
+# Use temp directory for cloud deployment (writable)
 TEMP_DIR = tempfile.gettempdir()
 DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
@@ -11,76 +14,145 @@ print(f"Database path: {DB_PATH}")
 
 mcp = FastMCP("ExpenseTracker")
 
-def init_db():  # Keep as sync for initialization
+def init_db():
+    """Initialize database synchronously on startup"""
     try:
-        # Use synchronous sqlite3 just for initialization
         import sqlite3
-        with sqlite3.connect(DB_PATH) as c:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS expenses(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    category TEXT NOT NULL,
-                    subcategory TEXT DEFAULT '',
-                    note TEXT DEFAULT ''
-                )
-            """)
-            # Test write access
-            c.execute("INSERT OR IGNORE INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')")
-            c.execute("DELETE FROM expenses WHERE category = 'test'")
-            print("Database initialized successfully with write access")
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
+        
+        # Create expenses table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS expenses(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                person TEXT DEFAULT 'ashu'
+            )
+        """)
+
+        # Create credits table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS credits(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                source TEXT NOT NULL,
+                subcategory TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                person TEXT DEFAULT 'ashu'
+            )
+        """)
+
+        # Test write access
+        conn.execute("INSERT OR IGNORE INTO expenses(date, amount, category, person) VALUES ('2000-01-01', 0, 'test', 'system')")
+        conn.execute("DELETE FROM expenses WHERE category = 'test'")
+        
+        conn.commit()
+        conn.close()
+        print("Database initialized successfully with write access")
+        
     except Exception as e:
         print(f"Database initialization error: {e}")
         raise
 
-# Initialize database synchronously at module load
+# Initialize on module load
 init_db()
 
 @mcp.tool()
-async def add_expense(date, amount, category, subcategory="", note=""):  # Changed: added async
-    '''Add a new expense entry to the database.'''
+async def add_expense(date: str, amount: float, category: str, person: str, subcategory: str = "", note: str = ""):
+    """Add a new expense entry to the database."""
     try:
-        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
-            cur = await c.execute(  # Changed: added await
-                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-                (date, amount, category, subcategory, note)
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            cursor = await conn.execute(
+                "INSERT INTO expenses(date, amount, category, subcategory, note, person) VALUES (?,?,?,?,?,?)",
+                (date, float(amount), category, subcategory, note, person)
             )
-            expense_id = cur.lastrowid
-            await c.commit()  # Changed: added await
-            return {"status": "success", "id": expense_id, "message": "Expense added successfully"}
-    except Exception as e:  # Changed: simplified exception handling
-        if "readonly" in str(e).lower():
-            return {"status": "error", "message": "Database is in read-only mode. Check file permissions."}
-        return {"status": "error", "message": f"Database error: {str(e)}"}
-    
-@mcp.tool()
-async def list_expenses(start_date, end_date):  # Changed: added async
-    '''List expense entries within an inclusive date range.'''
-    try:
-        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
-            cur = await c.execute(  # Changed: added await
-                """
-                SELECT id, date, amount, category, subcategory, note
-                FROM expenses
-                WHERE date BETWEEN ? AND ?
-                ORDER BY date DESC, id DESC
-                """,
-                (start_date, end_date)
-            )
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in await cur.fetchall()]  # Changed: added await
+            expense_id = cursor.lastrowid
+            await conn.commit()
+            return {"status": "ok", "id": expense_id, "message": f"Expense added successfully with ID {expense_id}"}
     except Exception as e:
-        return {"status": "error", "message": f"Error listing expenses: {str(e)}"}
+        return {"status": "error", "message": f"Failed to add expense: {str(e)}"}
 
 @mcp.tool()
-async def summarize(start_date, end_date, category=None):  # Changed: added async
-    '''Summarize expenses by category within an inclusive date range.'''
+async def add_credit(date: str, amount: float, source: str, person: str, subcategory: str = "", note: str = ""):
+    """Add a new credit/income entry to the database."""
     try:
-        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            cursor = await conn.execute(
+                "INSERT INTO credits(date, amount, source, subcategory, note, person) VALUES (?,?,?,?,?,?)",
+                (date, float(amount), source, subcategory, note, person)
+            )
+            credit_id = cursor.lastrowid
+            await conn.commit()
+            return {"status": "ok", "id": credit_id, "message": f"Credit added successfully with ID {credit_id}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to add credit: {str(e)}"}
+    
+@mcp.tool()
+async def list_expenses(start_date: str, end_date: str, person: str = None):
+    """List expense entries within an inclusive date range. Optionally filter by person."""
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = aiosqlite.Row
+            
             query = """
-                SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
+                SELECT id, date, amount, category, subcategory, note, person
+                FROM expenses
+                WHERE date BETWEEN ? AND ?
+            """
+            params = [start_date, end_date]
+
+            if person:
+                query += " AND person = ?"
+                params.append(person)
+
+            query += " ORDER BY date ASC, id ASC"
+
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to list expenses: {str(e)}"}
+
+@mcp.tool()
+async def list_credits(start_date: str, end_date: str, person: str = None):
+    """List credit/income entries within an inclusive date range. Optionally filter by person."""
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = aiosqlite.Row
+            
+            query = """
+                SELECT id, date, amount, source, subcategory, note, person
+                FROM credits
+                WHERE date BETWEEN ? AND ?
+            """
+            params = [start_date, end_date]
+
+            if person:
+                query += " AND person = ?"
+                params.append(person)
+
+            query += " ORDER BY date ASC, id ASC"
+
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to list credits: {str(e)}"}
+
+@mcp.tool()
+async def summarize(start_date: str, end_date: str, category: str = None, person: str = None):
+    """Summarize expenses by category within an inclusive date range. Optionally filter by category and/or person."""
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = aiosqlite.Row
+            
+            query = """
+                SELECT category, SUM(amount) AS total_amount
                 FROM expenses
                 WHERE date BETWEEN ? AND ?
             """
@@ -90,18 +162,137 @@ async def summarize(start_date, end_date, category=None):  # Changed: added asyn
                 query += " AND category = ?"
                 params.append(category)
 
-            query += " GROUP BY category ORDER BY total_amount DESC"
+            if person:
+                query += " AND person = ?"
+                params.append(person)
 
-            cur = await c.execute(query, params)  # Changed: added await
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in await cur.fetchall()]  # Changed: added await
+            query += " GROUP BY category ORDER BY category ASC"
+
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
     except Exception as e:
-        return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
+        return {"status": "error", "message": f"Failed to summarize expenses: {str(e)}"}
 
-@mcp.resource("expense:///categories", mime_type="application/json")  # Changed: expense:// → expense:///
-def categories():
+@mcp.tool()
+async def summarize_credits(start_date: str, end_date: str, source: str = None, person: str = None):
+    """Summarize credits/income by source within an inclusive date range. Optionally filter by source and/or person."""
     try:
-        # Provide default categories if file doesn't exist
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = aiosqlite.Row
+            
+            query = """
+                SELECT source, SUM(amount) AS total_amount
+                FROM credits
+                WHERE date BETWEEN ? AND ?
+            """
+            params = [start_date, end_date]
+
+            if source:
+                query += " AND source = ?"
+                params.append(source)
+
+            if person:
+                query += " AND person = ?"
+                params.append(person)
+
+            query += " GROUP BY source ORDER BY source ASC"
+
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to summarize credits: {str(e)}"}
+
+@mcp.tool()
+async def get_balance(start_date: str, end_date: str, person: str = None):
+    """Calculate net balance (total credits - total expenses) within a date range. Optionally filter by person."""
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            # Get total expenses
+            expense_query = "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE date BETWEEN ? AND ?"
+            expense_params = [start_date, end_date]
+
+            if person:
+                expense_query += " AND person = ?"
+                expense_params.append(person)
+
+            cursor = await conn.execute(expense_query, expense_params)
+            expense_result = await cursor.fetchone()
+            total_expenses = expense_result[0]
+
+            # Get total credits
+            credit_query = "SELECT COALESCE(SUM(amount), 0) FROM credits WHERE date BETWEEN ? AND ?"
+            credit_params = [start_date, end_date]
+
+            if person:
+                credit_query += " AND person = ?"
+                credit_params.append(person)
+
+            cursor = await conn.execute(credit_query, credit_params)
+            credit_result = await cursor.fetchone()
+            total_credits = credit_result[0]
+
+            net_balance = total_credits - total_expenses
+
+            result = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "total_credits": total_credits,
+                "total_expenses": total_expenses,
+                "net_balance": net_balance
+            }
+
+            if person:
+                result["person"] = person
+
+            return result
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to calculate balance: {str(e)}"}
+
+@mcp.tool()
+async def delete_expense(id: int):
+    """Delete an expense entry by ID."""
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            # Check if expense exists
+            cursor = await conn.execute("SELECT * FROM expenses WHERE id = ?", (id,))
+            result = await cursor.fetchone()
+            
+            if not result:
+                return {"status": "error", "message": f"Expense with id {id} not found"}
+
+            # Delete the expense
+            await conn.execute("DELETE FROM expenses WHERE id = ?", (id,))
+            await conn.commit()
+            return {"status": "ok", "message": f"Expense with id {id} deleted successfully"}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to delete expense: {str(e)}"}
+
+@mcp.tool()
+async def delete_credit(id: int):
+    """Delete a credit/income entry by ID."""
+    try:
+        async with aiosqlite.connect(DB_PATH, timeout=10.0) as conn:
+            # Check if credit exists
+            cursor = await conn.execute("SELECT * FROM credits WHERE id = ?", (id,))
+            result = await cursor.fetchone()
+            
+            if not result:
+                return {"status": "error", "message": f"Credit with id {id} not found"}
+
+            # Delete the credit
+            await conn.execute("DELETE FROM credits WHERE id = ?", (id,))
+            await conn.commit()
+            return {"status": "ok", "message": f"Credit with id {id} deleted successfully"}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to delete credit: {str(e)}"}
+
+@mcp.resource("expense://categories", mime_type="application/json")
+def categories():
+    """Read categories from JSON file"""
+    try:
+        # Default categories
         default_categories = {
             "categories": [
                 "Food & Dining",
@@ -117,16 +308,18 @@ def categories():
             ]
         }
         
+        # Try to read from file, fallback to defaults
         try:
             with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
                 return f.read()
         except FileNotFoundError:
-            import json
             return json.dumps(default_categories, indent=2)
+            
     except Exception as e:
-        return f'{{"error": "Could not load categories: {str(e)}"}}'
+        return f'{{"error": "Failed to read categories: {str(e)}"}}'
 
-# Start the server
+
+# For cloud deployment - run as HTTP server
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
-    # mcp.run()
+    import uvicorn
+    uvicorn.run(mcp.get_asgi_app(), host="0.0.0.0", port=8080)
